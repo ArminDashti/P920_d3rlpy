@@ -3,7 +3,7 @@ import os
 import torch
 import d3rlpy
 from d3rlpy.datasets import get_minari
-from d3rlpy.algos import SACConfig
+from d3rlpy.algos import SACConfig, BEARConfig, CQLConfig
 from d3rlpy.models.torch.policies import build_squashed_gaussian_distribution
 from d3rlpy.models.torch.parameters import get_parameter
 from d3rlpy.algos.qlearning.torch.sac_impl import SACActorLoss
@@ -13,6 +13,8 @@ from d3rlpy.algos import SAC
 from networks import SafeAction
 from d3rlpy.metrics import EnvironmentEvaluator
 from d3rlpy.metrics.evaluators import EnvironmentEvaluator
+from d3rlpy.preprocessing import StandardRewardScaler, StandardObservationScaler, MinMaxActionScaler
+from d3rlpy.datasets import get_cartpole, get_pendulum
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,7 +23,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def compute_actor_loss(self, batch, action):
     sa_obs = convert_to_torch(batch.observations, device=device)
     sa_act = convert_to_torch(batch.actions, device=device)
-    if torch.rand(1).item() < 0.7:
+    if torch.rand(1).item() < 0.0:
         result = safe_action(sa_obs, sa_act).round()
     else:
         result = torch.full((256,), 1.0)
@@ -55,17 +57,21 @@ def load_safe_action():
     model.load_state_dict(checkpoint['model_state_dict'])
     return model
     
-safe_action = load_safe_action()
-d3rlpy.algos.qlearning.torch.SACImpl.compute_actor_loss = compute_actor_loss
-d3rlpy.algos.qlearning.torch.SACImpl = safe_action
+# safe_action = load_safe_action()
+# d3rlpy.algos.qlearning.torch.SACImpl.compute_actor_loss = compute_actor_loss
+# d3rlpy.algos.qlearning.torch.SACImpl = safe_action
 
 
 def load_dataset(dataset_name="D4RL/door/expert-v2"):
+    return get_pendulum()
     return get_minari(dataset_name)
 
     
 def get_sac(device=device):
-    sac_config = SACConfig()
+    # sac_config = BEARConfig(reward_scaler=StandardRewardScaler(),
+    #                         observation_scaler = StandardObservationScaler(),
+    #                         action_scaler = MinMaxActionScaler())
+    sac_config = CQLConfig(critic_learning_rate=0.001)
     sac = sac_config.create(device=device)
     return sac
 
