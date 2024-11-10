@@ -1,121 +1,220 @@
 import argparse
-import os
 import torch
 import d3rlpy
-from d3rlpy.datasets import get_minari
-from d3rlpy.algos import SACConfig, BEARConfig, CQLConfig
-from d3rlpy.models.torch.policies import build_squashed_gaussian_distribution
-from d3rlpy.models.torch.parameters import get_parameter
-from d3rlpy.algos.qlearning.torch.sac_impl import SACActorLoss
-from d3rlpy.torch_utility import convert_to_torch 
-from d3rlpy.metrics import evaluate_qlearning_with_environment
-from d3rlpy.algos import SAC
-from networks import SafeAction
-from d3rlpy.metrics import EnvironmentEvaluator
+
+import numpy as np
+from dataclasses import dataclass
+from d3rlpy.datasets import get_minari, get_pendulum
+from d3rlpy.algos import SACConfig, CQLConfig, BEARConfig
 from d3rlpy.metrics.evaluators import EnvironmentEvaluator
-from d3rlpy.preprocessing import StandardRewardScaler, StandardObservationScaler, MinMaxActionScaler
-from d3rlpy.datasets import get_cartpole, get_pendulum
-
-
+from d3rlpy.algos.qlearning.base import QLearningAlgoBase
+from d3rlpy.torch_utility import TorchMiniBatch
+from d3rlpy.algos.qlearning.torch import sac_impl
+from d3rlpy.models.torch import get_parameter, build_squashed_gaussian_distribution
+from d3rlpy.algos.qlearning.torch.ddpg_impl import DDPGBaseCriticLoss 
+import gymnasium as gym
+from gymnasium.wrappers import FlattenObservation, RecordVideo
+from d3rlpy.preprocessing import StandardRewardScaler, MinMaxRewardScaler
+reward_scaler = StandardRewardScaler(mean=0.0, std=1.0)
+reward_scaler = MinMaxRewardScaler(minimum=0.0, maximum=1.0)
+from d3rlpy.dataclass_utils import asdict_as_float
 device = "cuda" if torch.cuda.is_available() else "cpu"
+# d3rlpy.seed(42)
 
+@dataclass
+class ExtendedTorchMiniBatch:
+    torch_batch: TorchMiniBatch
+    noise: torch.Tensor
 
-def compute_actor_loss(self, batch, action):
-    sa_obs = convert_to_torch(batch.observations, device=device)
-    sa_act = convert_to_torch(batch.actions, device=device)
-    if torch.rand(1).item() < 0.0:
-        result = safe_action(sa_obs, sa_act).round()
-    else:
-        result = torch.full((256,), 1.0)
+    @property
+    def observations(self):
+        return self.torch_batch.observations
 
-    dist = build_squashed_gaussian_distribution(action)
-    sampled_action, log_prob = dist.sample_with_log_prob()
+    @property
+    def actions(self):
+        return self.torch_batch.actions
 
-    temp_loss = self.update_temp(log_prob) if self._modules.temp_optim else torch.tensor(
-        0.0, dtype=torch.float32, device=sampled_action.device
-    )
-    entropy = get_parameter(self._modules.log_temp).exp() * log_prob
-    q_t = self._q_func_forwarder.compute_expected_q(
-        batch.observations, sampled_action, "min"
-    )
-    return SACActorLoss(
-        actor_loss=(entropy*result - q_t).mean(),
-        temp_loss=temp_loss,
-        temp=get_parameter(self._modules.log_temp).exp()[0][0],
-    )
+    @property
+    def rewards(self):
+        return self.torch_batch.rewards
 
+    @property
+    def next_observations(self):
+        return self.torch_batch.next_observations
 
-def load_safe_action():
-    parser = argparse.ArgumentParser(description='Load the safe action model.')
-    parser.add_argument('--state_dim', type=int, default=39, help='State dimension of the model.')
-    parser.add_argument('--action_dim', type=int, default=28, help='Action dimension of the model.')
-    parser.add_argument('--safe_action_hidden_dim', type=int, default=256, help='Hidden dimension of the model.')
-    load_args = parser.parse_args()
+    @property
+    def terminals(self):
+        return self.torch_batch.terminals
 
-    model = SafeAction(load_args)
-    checkpoint = torch.load(r"C:\Users\armin\P920_output\check_points\safe_action\latest_checkpoint.pth")
-    model.load_state_dict(checkpoint['model_state_dict'])
-    return model
+    @property
+    def next_actions(self):
+        return self.torch_batch.next_actions
+
+    @property
+    def returns_to_go(self):
+        return self.torch_batch.returns_to_go
+
+    @property
+    def intervals(self):
+        return self.torch_batch.intervals
+
+    @property
+    def device(self):
+        return self.torch_batch.device
+
+def initialize_seed(seed=42):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        
+def compute_critic_loss(self, batch, q_tpn):
+        loss = self._q_func_forwarder.compute_error(
+            observations=batch.observations,
+            actions=batch.actions,
+            rewards=batch.rewards,
+            target=q_tpn,
+            terminals=batch.terminals,
+            gamma=self._gamma**batch.intervals,
+        ) + torch.norm(batch.noise)
+        return DDPGBaseCriticLoss(loss)
     
-# safe_action = load_safe_action()
-# d3rlpy.algos.qlearning.torch.SACImpl.compute_actor_loss = compute_actor_loss
-# d3rlpy.algos.qlearning.torch.SACImpl = safe_action
 
 
-def load_dataset(dataset_name="D4RL/door/expert-v2"):
-    return get_pendulum()
+
+def update_with_noise(self, batch):
+    torch_batch = TorchMiniBatch.from_batch(
+        batch=batch,
+        gamma=self._config.gamma,
+        compute_returns_to_go=self.need_returns_to_go,
+        device=self._device,
+        observation_scaler=self._config.observation_scaler,
+        action_scaler=self._config.action_scaler,
+        reward_scaler=self._config.reward_scaler,
+    )
+    with torch.no_grad():
+        rand_value = torch.rand(1).item()
+        noise, modified_actions = create_modified_actions(torch_batch, rand_value)
+        torch_batch = refresh_torch_batch(torch_batch, modified_actions)
+        extended_torch_batch = ExtendedTorchMiniBatch(torch_batch=torch_batch, noise=noise)
+    
+    loss_dict = self._impl.update(extended_torch_batch, self._grad_step)
+    noise_norm = torch.norm(extended_torch_batch.noise)
+    loss_dict['critic_loss']
+    self._grad_step += 1
+    return loss_dict
+
+
+def update_critic(self, batch):
+    self._modules.critic_optim.zero_grad()
+    q_tpn = self.compute_target(batch)
+    noise_norm = torch.norm(batch.noise)
+    loss = self.compute_critic_loss(batch, q_tpn)
+    # noise_norm = torch.norm(batch.noise) / torch.numel(batch.noise)
+    
+    loss.critic_loss.backward()
+    self._modules.critic_optim.step()
+    return asdict_as_float(loss)
+    
+    
+def create_modified_actions(torch_batch, rand_value):
+    if rand_value < 0.4:
+        mean = torch.mean(torch_batch.actions, dim=0)
+        std = torch.std(torch_batch.actions, dim=0)
+        modified_actions = torch.normal(mean=mean, std=std).expand_as(torch_batch.actions).to(torch_batch.device)
+        noise = torch.abs(modified_actions - torch_batch.actions)  # Ensure noise is positive
+    elif rand_value < 0.5:
+        shuffled_indices = torch.randperm(torch_batch.actions.size(0))
+        modified_actions = torch_batch.actions[shuffled_indices]
+        noise = (torch_batch.actions - modified_actions).abs()
+    else:
+        noise = torch.zeros_like(torch_batch.actions)
+        modified_actions = torch_batch.actions
+    return noise, modified_actions
+
+def refresh_torch_batch(torch_batch, modified_actions):
+    return TorchMiniBatch(
+        observations=torch_batch.observations,
+        actions=modified_actions,
+        rewards=torch_batch.rewards,
+        next_observations=torch_batch.next_observations,
+        terminals=torch_batch.terminals,
+        next_actions=torch_batch.next_actions,
+        returns_to_go=torch_batch.returns_to_go,
+        intervals=torch_batch.intervals,
+        device=torch_batch.device
+    )
+
+def compute_custom_target(self, batch):
+    with torch.no_grad():
+        dist = build_squashed_gaussian_distribution(
+            self._modules.policy(batch.next_observations)
+        )
+        action, log_prob = dist.sample_with_log_prob()
+        entropy = get_parameter(self._modules.log_temp).exp() * log_prob
+        target = self._targ_q_func_forwarder.compute_target(
+            batch.next_observations,
+            action,
+            reduction="min",
+        )
+        return target - entropy
+
+def customize_SAC():
+    
+    QLearningAlgoBase.update = update_with_noise
+    sac_impl.SACImpl.compute_target = compute_custom_target
+    sac_impl.SACImpl.update_critic = update_critic
+    # d3rlpy.models.torch.q_functions.ensemble_q_function = compute_ensemble_q_function_error
+    sac_impl.SACImpl.compute_critic_loss = compute_critic_loss
+    
+
+def fetch_dataset(dataset_name):
     return get_minari(dataset_name)
 
-    
-def get_sac(device=device):
-    # sac_config = BEARConfig(reward_scaler=StandardRewardScaler(),
-    #                         observation_scaler = StandardObservationScaler(),
-    #                         action_scaler = MinMaxActionScaler())
-    sac_config = CQLConfig(critic_learning_rate=0.001)
-    sac = sac_config.create(device=device)
-    return sac
+def create_algorithm_instance(args):
+    if args.base_algo == 'SA':
+        customize_SAC()
+        return SACConfig().create(device=device)
+    elif args.base_algo == 'SAC':
+        return SACConfig(reward_scaler=reward_scaler).create(device=device)
+    elif args.base_algo == 'CQL':
+        return CQLConfig().create(device=device)
+    elif args.base_algo == 'BEAR':
+        return BEARConfig().create(device=device)
+    else:
+        raise ValueError(f"Unsupported algorithm: {args.base_algo}")
 
-def evaluate_after_epoch(algo, epoch, total_step):
-    eval_score = evaluate_qlearning_with_environment(algo)
-    print(f"Epoch {epoch}: Evaluation Score = {eval_score}")
+def train_rl_model(gym_env, algorithm_instance, dataset, n_steps, video_folder):
+    env = gym.make(gym_env, render_mode='rgb_array')
+    env = RecordVideo(env, video_folder=video_folder)
+    d3rlpy.envs.utility.seed_env(env, 42)
+    algorithm_instance.build_with_env(env)
+    algorithm_instance.fit(dataset, n_steps=n_steps, evaluators={"environment": EnvironmentEvaluator(env)})
 
-
-def train_sac(env, sac, dataset, n_steps=1000000):
-    sac.build_with_env(env)
-    sac.fit(
-    dataset,
-    n_steps=n_steps,
-    evaluators={
-        "environment": EnvironmentEvaluator(env)  # Add environment evaluator
-    },)
-
-
-def predict_action(sac, env):
+def predict_agent_action(algorithm_instance, env):
     observation = env.reset()
-    return sac.predict(observation)
-
+    return algorithm_instance.predict(observation)
 
 def run(args):
-    dataset, env = load_dataset()
-    checkpoint_path = os.path.join(args.assets_dir, 'check_points', 'safe_action', 'safe_action_checkpoint.pth')
-    sac = get_sac(device=device)
-    
-    # Ensure SACImpl is properly initialized before patching
-    if sac._impl is not None:
-        sac._impl.compute_actor_loss = lambda batch, action: compute_actor_loss(sac._impl, batch, action, checkpoint_path=checkpoint_path)
-    
-    train_sac(env, sac, dataset)
-    actions = predict_action(sac, env)
+    dataset, gym_env = fetch_dataset(args.minari_env)
+    algorithm_instance = create_algorithm_instance(args)
+    train_rl_model(args.gym_env, algorithm_instance, dataset, args.n_steps, args.video_folder)
+    actions = predict_agent_action(algorithm_instance, gym.make(args.gym_env))
     print(actions)
-
 
 def main():
     parser = argparse.ArgumentParser(description='Train and predict with SAC using a safe action model.')
-    parser.add_argument('--assets_dir', type=str, required=True, help='Directory containing assets like checkpoints.')
-    parser.add_argument('--checkpoint_path', type=str, required=False, help='Path to the safe action checkpoint.')
+    parser.add_argument('--assets_dir', type=str, default=r'C:\Users\armin\P920_output')
+    parser.add_argument('--minari_env', type=str, default='D4RL/door/expert-v2', help='Minari dataset environment name')
+    parser.add_argument('--base_algo', type=str, default='SA', help='Base algorithm to use (SAC, CQL, BEAR)')
+    parser.add_argument('--base_algo_bs', type=int, default=1024, help='Batch size for the base algorithm')
+    parser.add_argument('--gym_env', type=str, default='AdroitHandDoor-v1', help='The name of the Gym environment to train on')
+    parser.add_argument('--video_folder', type=str, default='c:/users/armin/v/sac', help='Folder to save recorded videos')
+    parser.add_argument('--n_steps', type=int, default=1000000, help='Number of training steps')
+
     args = parser.parse_args()
     run(args)
 
-
 if __name__ == "__main__":
+    # initialize_seed()
     main()
