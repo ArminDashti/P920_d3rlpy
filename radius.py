@@ -1,27 +1,54 @@
 import argparse
 import torch
 import d3rlpy
-
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-from dataclasses import dataclass
-from d3rlpy.datasets import get_minari, get_pendulum
+from dataclasses import dataclass, field
+from d3rlpy.datasets import get_minari
 from d3rlpy.algos import SACConfig, CQLConfig, BEARConfig
 from d3rlpy.metrics.evaluators import EnvironmentEvaluator
 from d3rlpy.algos.qlearning.base import QLearningAlgoBase
 from d3rlpy.torch_utility import TorchMiniBatch
 from d3rlpy.algos.qlearning.torch import sac_impl
 from d3rlpy.models.torch import get_parameter, build_squashed_gaussian_distribution
-from d3rlpy.algos.qlearning.torch.ddpg_impl import DDPGBaseCriticLoss 
+from d3rlpy.algos.qlearning.torch.ddpg_impl import DDPGBaseCriticLoss
 import gymnasium as gym
-from gymnasium.wrappers import FlattenObservation, RecordVideo
+from gymnasium.wrappers import RecordVideo
 from d3rlpy.preprocessing import StandardRewardScaler, MinMaxRewardScaler
-reward_scaler = StandardRewardScaler(mean=0.0, std=1.0)
-reward_scaler = MinMaxRewardScaler(minimum=0.0, maximum=1.0)
 from d3rlpy.dataclass_utils import asdict_as_float
+import sys
+import inspect
 device = "cuda" if torch.cuda.is_available() else "cpu"
-# d3rlpy.seed(42)
 
 
+def initialize_seed(seed=42):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+
+
+class RadiusNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(RadiusNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, 39)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x = self.normalize(x)
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        # x = self.sigmoid(x) * 0.09 + 0.01  # Scale output to range [0.01, 0.1]
+        return x
+
+    def normalize(self, x):
+        return (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
+    
+    
 def sample_in_radius_per_dim(point, radii):
     direction = torch.randn_like(point)
     direction = direction / direction.abs()
@@ -30,12 +57,24 @@ def sample_in_radius_per_dim(point, radii):
     return sampled_point
 
 
+def compute_critic_loss(self, batch, q_tpn):
+    loss = self._q_func_forwarder.compute_error(
+        observations=batch.observations,
+        actions=batch.actions,
+        rewards=batch.rewards,
+        target=q_tpn,
+        terminals=batch.terminals,
+        gamma=self._gamma**batch.intervals,
+    )  + batch.new_observations.mean()
+    print(batch.new_observations.mean())
+    return DDPGBaseCriticLoss(loss)
+
 
 @dataclass
 class ExtendedTorchMiniBatch:
     torch_batch: TorchMiniBatch
-    noise: torch.Tensor
-
+    new_observations: torch.Tensor = field(default=None)
+    
     @property
     def observations(self):
         return self.torch_batch.observations
@@ -51,7 +90,7 @@ class ExtendedTorchMiniBatch:
     @property
     def next_observations(self):
         return self.torch_batch.next_observations
-
+    
     @property
     def terminals(self):
         return self.torch_batch.terminals
@@ -71,28 +110,18 @@ class ExtendedTorchMiniBatch:
     @property
     def device(self):
         return self.torch_batch.device
-
-def initialize_seed(seed=42):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        
-def compute_critic_loss(self, batch, q_tpn):
-        loss = self._q_func_forwarder.compute_error(
-            observations=batch.observations,
-            actions=batch.actions,
-            rewards=batch.rewards,
-            target=q_tpn,
-            terminals=batch.terminals,
-            gamma=self._gamma**batch.intervals,
-        ) + torch.norm(batch.noise)
-        return DDPGBaseCriticLoss(loss)
+    
+    def update_new_observations(self, new_observations):
+        self.new_observations = new_observations
     
 
+def refresh_torch_batch(torch_batch, new_observations):
+    extended_batch = ExtendedTorchMiniBatch(torch_batch=torch_batch)
+    extended_batch.update_new_observations(new_observations)
+    return extended_batch
 
 
-def update_with_noise(self, batch):
+def update(self, batch):
     torch_batch = TorchMiniBatch.from_batch(
         batch=batch,
         gamma=self._config.gamma,
@@ -100,61 +129,33 @@ def update_with_noise(self, batch):
         device=self._device,
         observation_scaler=self._config.observation_scaler,
         action_scaler=self._config.action_scaler,
-        reward_scaler=self._config.reward_scaler,
-    )
+        reward_scaler=self._config.reward_scaler)
+    
     with torch.no_grad():
         rand_value = torch.rand(1).item()
-        noise, modified_actions = create_modified_actions(torch_batch, rand_value)
-        torch_batch = refresh_torch_batch(torch_batch, modified_actions)
-        extended_torch_batch = ExtendedTorchMiniBatch(torch_batch=torch_batch, noise=noise)
+        if rand_value < 0.5:
+            radius_net_input = torch_batch.observations
+            radii = self.radius_net(radius_net_input)
+            new_observations = sample_in_radius_per_dim(torch_batch.observations, radii).to(torch_batch.device)
+        else:
+            new_observations = torch.ones_like(torch_batch.observations)
+
+        extended_torch_batch = refresh_torch_batch(torch_batch, new_observations)
     
     loss_dict = self._impl.update(extended_torch_batch, self._grad_step)
-    noise_norm = torch.norm(extended_torch_batch.noise)
-    loss_dict['critic_loss']
     self._grad_step += 1
     return loss_dict
 
 
 def update_critic(self, batch):
     self._modules.critic_optim.zero_grad()
+    self.radius_optim.zero_grad()
     q_tpn = self.compute_target(batch)
-    noise_norm = torch.norm(batch.noise)
     loss = self.compute_critic_loss(batch, q_tpn)
-    # noise_norm = torch.norm(batch.noise) / torch.numel(batch.noise)
-    
     loss.critic_loss.backward()
     self._modules.critic_optim.step()
+    self.radius_optim.step()
     return asdict_as_float(loss)
-    
-    
-def create_modified_actions(torch_batch, rand_value):
-    if rand_value < 0.4:
-        mean = torch.mean(torch_batch.actions, dim=0)
-        std = torch.std(torch_batch.actions, dim=0)
-        modified_actions = torch.normal(mean=mean, std=std).expand_as(torch_batch.actions).to(torch_batch.device)
-        noise = torch.abs(modified_actions - torch_batch.actions)  # Ensure noise is positive
-    elif rand_value < 0.5:
-        shuffled_indices = torch.randperm(torch_batch.actions.size(0))
-        modified_actions = torch_batch.actions[shuffled_indices]
-        noise = (torch_batch.actions - modified_actions).abs()
-    else:
-        noise = torch.zeros_like(torch_batch.actions)
-        modified_actions = torch_batch.actions
-    return noise, modified_actions
-
-
-def refresh_torch_batch(torch_batch, modified_actions):
-    return TorchMiniBatch(
-        observations=torch_batch.observations,
-        actions=modified_actions,
-        rewards=torch_batch.rewards,
-        next_observations=torch_batch.next_observations,
-        terminals=torch_batch.terminals,
-        next_actions=torch_batch.next_actions,
-        returns_to_go=torch_batch.returns_to_go,
-        intervals=torch_batch.intervals,
-        device=torch_batch.device
-    )
 
 
 def compute_custom_target(self, batch):
@@ -170,31 +171,42 @@ def compute_custom_target(self, batch):
             reduction="min",
         )
         return target - entropy
-
-def customize_SAC():
     
-    QLearningAlgoBase.update = update_with_noise
+
+def customize_SAC(args, radius_optim):
+    QLearningAlgoBase.update = update
     sac_impl.SACImpl.compute_target = compute_custom_target
     sac_impl.SACImpl.update_critic = update_critic
-    # d3rlpy.models.torch.q_functions.ensemble_q_function = compute_ensemble_q_function_error
     sac_impl.SACImpl.compute_critic_loss = compute_critic_loss
-    
+    sac_impl.SACImpl.radius_optim = radius_optim
+
 
 def fetch_dataset(dataset_name):
     return get_minari(dataset_name)
 
+
 def create_algorithm_instance(args):
     if args.base_algo == 'SA':
-        customize_SAC()
-        return SACConfig().create(device=device)
+        
+        sac = SACConfig().create(device=device)
+        radius_net = RadiusNetwork(input_size=args.state_dim, hidden_size=256).to(device)
+        sac.radius_net = radius_net
+        radius_optim = optim.Adam(radius_net.parameters(), lr=0.0001)
+        customize_SAC(args, radius_optim)
+        return sac
+    
     elif args.base_algo == 'SAC':
-        return SACConfig(reward_scaler=reward_scaler).create(device=device)
+        return SACConfig(reward_scaler=MinMaxRewardScaler(minimum=0.0, maximum=1.0)).create(device=device)
+    
     elif args.base_algo == 'CQL':
         return CQLConfig().create(device=device)
+    
     elif args.base_algo == 'BEAR':
         return BEARConfig().create(device=device)
+    
     else:
         raise ValueError(f"Unsupported algorithm: {args.base_algo}")
+
 
 def train_rl_model(gym_env, algorithm_instance, dataset, n_steps, video_folder):
     env = gym.make(gym_env, render_mode='rgb_array')
@@ -203,16 +215,22 @@ def train_rl_model(gym_env, algorithm_instance, dataset, n_steps, video_folder):
     algorithm_instance.build_with_env(env)
     algorithm_instance.fit(dataset, n_steps=n_steps, evaluators={"environment": EnvironmentEvaluator(env)})
 
+
 def predict_agent_action(algorithm_instance, env):
     observation = env.reset()
     return algorithm_instance.predict(observation)
 
+
 def run(args):
+    input_size = 4
+    hidden_size = 16
+    
     dataset, gym_env = fetch_dataset(args.minari_env)
     algorithm_instance = create_algorithm_instance(args)
     train_rl_model(args.gym_env, algorithm_instance, dataset, args.n_steps, args.video_folder)
     actions = predict_agent_action(algorithm_instance, gym.make(args.gym_env))
     print(actions)
+
 
 def main():
     parser = argparse.ArgumentParser(description='Train and predict with SAC using a safe action model.')
@@ -223,10 +241,10 @@ def main():
     parser.add_argument('--gym_env', type=str, default='AdroitHandDoor-v1', help='The name of the Gym environment to train on')
     parser.add_argument('--video_folder', type=str, default='c:/users/armin/v/sac', help='Folder to save recorded videos')
     parser.add_argument('--n_steps', type=int, default=1000000, help='Number of training steps')
+    parser.add_argument('--state_dim', type=int, default=39, help='Number of training steps')
 
     args = parser.parse_args()
     run(args)
 
 if __name__ == "__main__":
-    # initialize_seed()
     main()
