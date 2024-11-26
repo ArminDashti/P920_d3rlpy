@@ -17,7 +17,6 @@ from tianshou.utils.net.continuous import ActorProb, Critic
 from tianshou.policy.base import TLearningRateScheduler, TrainingStats
 from tianshou.utils.conversion import to_optional_float
 
-
 def download(dataset_id='D4RL/pen/expert-v2'):
     dataset = minari.load_dataset(dataset_id, True)
     # return dataset
@@ -42,8 +41,8 @@ def download(dataset_id='D4RL/pen/expert-v2'):
         'truncations': np.array(truncations),
         'next_observations': np.array(next_observations),
         'dones': np.logical_or(terminations, truncations).astype(int),
-        'in_dist': np.ones(len(observations))
     }
+
 
 
 _, minari_ds = download()
